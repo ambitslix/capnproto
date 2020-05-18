@@ -98,6 +98,7 @@ function(CAPNP_GENERATE_CPP SOURCES HEADERS)
     set(output_base "${CAPNPC_OUTPUT_DIR}${output_path}")
 
     if(MINGW)
+      set(CAPNP_EXECUTABLE capnp.exe)
       add_custom_command(
         OUTPUT "${output_base}.c++" "${output_base}.h"
         COMMAND "wine"
