@@ -23,7 +23,6 @@
 #
 # TODO: convert to cmake_parse_arguments
 
-MESSAGE(STATUS "CAPNP_EXECUTABLE ${CAPNP_EXECUTABLE}")
 function(CAPNP_GENERATE_CPP SOURCES HEADERS)
   if(NOT ARGN)
     message(SEND_ERROR "CAPNP_GENERATE_CPP() called without any source files.")
@@ -74,11 +73,6 @@ function(CAPNP_GENERATE_CPP SOURCES HEADERS)
     endforeach()
   endif()
 
-  if(MINGW)
-    MESSAGE(STATUS "CAPNP_EXECUTABLE ${CAPNP_EXECUTABLE}")
-    set(CAPNP_EXECUTABLE capnp.exe)
-  endif()
-
   set(${SOURCES})
   set(${HEADERS})
   foreach(schema_file ${ARGN})
@@ -102,22 +96,39 @@ function(CAPNP_GENERATE_CPP SOURCES HEADERS)
 
     string(SUBSTRING "${file_path}" ${prefix_len} -1 output_path)
     set(output_base "${CAPNPC_OUTPUT_DIR}${output_path}")
-    
-    add_custom_command(
-      OUTPUT "${output_base}.c++" "${output_base}.h"
-      COMMAND "wine"
-      ARGS 
-          ${CAPNP_EXECUTABLE}
-          compile
-          -o ${CAPNPC_CXX_EXECUTABLE}${output_dir}
-          --src-prefix ${CAPNPC_SRC_PREFIX}
-          ${include_path}
-          ${CAPNPC_FLAGS}
-          ${file_path}
-      DEPENDS "${schema_file}" ${tool_depends}
-      COMMENT "Compiling Cap'n Proto schema ${schema_file}"
-      VERBATIM
-    )
+
+    if(MINGW)
+      add_custom_command(
+        OUTPUT "${output_base}.c++" "${output_base}.h"
+        COMMAND "wine"
+        ARGS 
+            ${CAPNP_EXECUTABLE}
+            compile
+            -o ${CAPNPC_CXX_EXECUTABLE}${output_dir}
+            --src-prefix ${CAPNPC_SRC_PREFIX}
+            ${include_path}
+            ${CAPNPC_FLAGS}
+            ${file_path}
+        DEPENDS "${schema_file}" ${tool_depends}
+        COMMENT "Compiling Cap'n Proto schema ${schema_file}"
+        VERBATIM
+      )
+    else()
+      add_custom_command(
+        OUTPUT "${output_base}.c++" "${output_base}.h"
+        COMMAND ${CAPNP_EXECUTABLE}
+        ARGS 
+            compile
+            -o ${CAPNPC_CXX_EXECUTABLE}${output_dir}
+            --src-prefix ${CAPNPC_SRC_PREFIX}
+            ${include_path}
+            ${CAPNPC_FLAGS}
+            ${file_path}
+        DEPENDS "${schema_file}" ${tool_depends}
+        COMMENT "Compiling Cap'n Proto schema ${schema_file}"
+        VERBATIM
+      )
+    endif()
 
     list(APPEND ${SOURCES} "${output_base}.c++")
     list(APPEND ${HEADERS} "${output_base}.h")
