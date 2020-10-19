@@ -20,11 +20,11 @@
 // THE SOFTWARE.
 
 #if _WIN32
-#define WIN32_LEAN_AND_MEAN 1  // lolz
-#define WINVER 0x0600
-#define _WIN32_WINNT 0x0600
+#include "win32-api-version.h"
 #define NOGDI  // NOGDI is needed to make EXPECT_EQ(123u, *lock) compile for some reason
 #endif
+
+#include "time.h"
 
 #define KJ_MUTEX_TEST 1
 
@@ -59,6 +59,29 @@ TEST(Mutex, MutexGuarded) {
     EXPECT_EQ(123u, *lock);
     EXPECT_EQ(123u, value.getAlreadyLockedExclusive());
 
+#if KJ_USE_FUTEX
+    auto timeout = MILLISECONDS * 50;
+
+    auto startTime = systemPreciseMonotonicClock().now();
+    EXPECT_TRUE(value.lockExclusiveWithTimeout(timeout) == nullptr);
+    auto duration = startTime - systemPreciseMonotonicClock().now();
+    EXPECT_TRUE(duration < timeout);
+
+    startTime = systemPreciseMonotonicClock().now();
+    EXPECT_TRUE(value.lockSharedWithTimeout(timeout) == nullptr);
+    duration = startTime - systemPreciseMonotonicClock().now();
+    EXPECT_TRUE(duration < timeout);
+
+    // originally, upon timing out, the exclusive requested flag would be removed
+    // from the futex state. if we did remove the exclusive request flag this test
+    // would hang.
+    Thread lockTimeoutThread([&]() {
+      // try to timeout during 10 ms delay
+      Maybe<Locked<uint>> maybeLock = value.lockExclusiveWithTimeout(MILLISECONDS * 8);
+      EXPECT_TRUE(maybeLock == nullptr);
+    });
+#endif
+
     Thread thread([&]() {
       Locked<uint> threadLock = value.lockExclusive();
       EXPECT_EQ(456u, *threadLock);
@@ -70,6 +93,11 @@ TEST(Mutex, MutexGuarded) {
     *lock = 456;
     auto earlyRelease = kj::mv(lock);
   }
+
+#if KJ_USE_FUTEX
+  EXPECT_EQ(789u, *KJ_ASSERT_NONNULL(value.lockExclusiveWithTimeout(MILLISECONDS * 50)));
+  EXPECT_EQ(789u, *KJ_ASSERT_NONNULL(value.lockSharedWithTimeout(MILLISECONDS * 50)));
+#endif
 
   EXPECT_EQ(789u, *value.lockExclusive());
 
@@ -278,14 +306,16 @@ TEST(Mutex, WhenWithTimeout) {
     auto start = clock.now();
     uint m = value.when([](uint n) { return n == 0; }, [&](uint& n) {
       KJ_ASSERT(n == 101);
-      KJ_EXPECT(clock.now() - start >= 10 * kj::MILLISECONDS);
+      auto t = clock.now() - start;
+      KJ_EXPECT(t >= 10 * kj::MILLISECONDS, t);
       return 12;
     }, 10 * kj::MILLISECONDS);
     KJ_EXPECT(m == 12);
 
     m = value.when([](uint n) { return n == 0; }, [&](uint& n) {
       KJ_ASSERT(n == 101);
-      KJ_EXPECT(clock.now() - start >= 20 * kj::MILLISECONDS);
+      auto t = clock.now() - start;
+      KJ_EXPECT(t >= 20 * kj::MILLISECONDS, t);
       return 34;
     }, 10 * kj::MILLISECONDS);
     KJ_EXPECT(m == 34);

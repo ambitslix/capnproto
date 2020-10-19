@@ -143,7 +143,7 @@ public:
   MallocMessageBuilder message;
 };
 
-class LocalCallContext final: public CallContextHook, public kj::Refcounted {
+class LocalCallContext final: public CallContextHook, public ResponseHook, public kj::Refcounted {
 public:
   LocalCallContext(kj::Own<MallocMessageBuilder>&& request, kj::Own<ClientHook> clientRef,
                    kj::Own<kj::PromiseFulfiller<void>> cancelAllowedFulfiller)
@@ -236,8 +236,23 @@ public:
     // Now the other branch returns the response from the context.
     auto promise = forked.addBranch().then(kj::mvCapture(context,
         [](kj::Own<LocalCallContext>&& context) {
-      context->getResults(MessageSize { 0, 0 });  // force response allocation
-      return kj::mv(KJ_ASSERT_NONNULL(context->response));
+      // force response allocation
+      auto reader = context->getResults(MessageSize { 0, 0 }).asReader();
+
+      if (context->isShared()) {
+        // We can't just move away context->response as `context` itself is still referenced by
+        // something -- probably a Pipeline object. As a bit of a hack, LocalCallContext itself
+        // implements ResponseHook so that we can just return a ref on it.
+        //
+        // TODO(cleanup): Maybe ResponseHook should be refcounted? Note that context->response
+        //   might not necessarily contain a LocalResponse if it was resolved by a tail call, so
+        //   we'd have to add refcounting to all ResponseHook implementations.
+        context->releaseParams();      // The call is done so params can definitely be dropped.
+        context->clientRef = nullptr;  // Definitely not using the client cap anymore either.
+        return Response<AnyPointer>(reader, kj::mv(context));
+      } else {
+        return kj::mv(KJ_ASSERT_NONNULL(context->response));
+      }
     }));
 
     // We return the other branch.
@@ -304,6 +319,49 @@ private:
 
   kj::Promise<void> selfResolutionOp;
   // Represents the operation which will set `redirect` when possible.
+
+  kj::HashMap<kj::Array<PipelineOp>, kj::Own<ClientHook>> clientMap;
+  // If the same pipelined cap is requested twice, we have to return the same object. This is
+  // necessary because each ClientHook we create is a QueuedClient which queues up calls. If we
+  // return a new one each time, there will be several queues, and ordering of calls will be lost
+  // between the queues.
+  //
+  // One case where this is particularly problematic is with promises resolved over RPC. Consider
+  // this case:
+  //
+  // * Alice holds a promise capability P pointing towards Bob.
+  // * Bob makes a call Q on an object hosted by Alice.
+  // * Without waiting for Q to complete, Bob obtains a pipelined-promise capability for Q's
+  //   eventual result, P2.
+  // * Alice invokes a method M on P. The call is sent to Bob.
+  // * Bob resolves Alice's original promise P to P2.
+  // * Alice receives a Resolve message from Bob resolving P to Q's eventual result.
+  //   * As a result, Alice calls getPipelinedCap() on the QueuedPipeline for Q's result, which
+  //     returns a QueuedClient for that result, which we'll call QR1.
+  //   * Alice also sends a Disembargo to Bob.
+  // * Alice calls a method M2 on P. This call is blocked locally waiting for the disembargo to
+  //   complete.
+  // * Bob receives Alice's first method call, M. Since it's addressed to P, which later resolved
+  //   to Q's result, Bob reflects the call back to Alice.
+  // * Alice receives the reflected call, which is addressed to Q's result.
+  //   * Alice calls getPipelinedCap() on the QueuedPipeline for Q's result, which returns a
+  //     QueuedClient for that result, which we'll call QR2.
+  //   * Alice enqueues the call M on QR2.
+  // * Bob receives Alice's Disembargo message, and reflects it back.
+  // * Alices receives the Disembrago.
+  //   * Alice unblocks the method cgall M2, which had been blocked on the embargo.
+  //   * The call M2 is then equeued onto QR1.
+  // * Finally, the call Q completes.
+  //   * This causes QR1 and QR2 to resolve to their final destinations. But if QR1 and QR2 are
+  //     separate objects, then one of them must resolve first. QR1 was created first, so naturally
+  //     it resolves first, followed by QR2.
+  //   * Because QR1 resolves first, method call M2 is delivered first.
+  //   * QR2 resolves second, so method call M1 is delivered next.
+  //   * THIS IS THE WRONG ORDER!
+  //
+  // In order to avoid this problem, it's necessary for QR1 and QR2 to be the same object, so that
+  // they share the same call queue. In this case, M2 is correctly enqueued onto QR2 *after* M1 was
+  // enqueued on QR1, and so the method calls are delivered in the correct order.
 };
 
 class QueuedClient final: public ClientHook, public kj::Refcounted {
@@ -444,12 +502,15 @@ kj::Own<ClientHook> QueuedPipeline::getPipelinedCap(kj::Array<PipelineOp>&& ops)
   KJ_IF_MAYBE(r, redirect) {
     return r->get()->getPipelinedCap(kj::mv(ops));
   } else {
-    auto clientPromise = promise.addBranch().then(kj::mvCapture(ops,
-        [](kj::Array<PipelineOp>&& ops, kj::Own<PipelineHook> pipeline) {
-          return pipeline->getPipelinedCap(kj::mv(ops));
-        }));
-
-    return kj::refcounted<QueuedClient>(kj::mv(clientPromise));
+    return clientMap.findOrCreate(ops.asPtr(), [&]() {
+      auto clientPromise = promise.addBranch()
+          .then([ops = KJ_MAP(op, ops) { return op; }](kj::Own<PipelineHook> pipeline) {
+        return pipeline->getPipelinedCap(kj::mv(ops));
+      });
+      return kj::HashMap<kj::Array<PipelineOp>, kj::Own<ClientHook>>::Entry {
+        kj::mv(ops), kj::refcounted<QueuedClient>(kj::mv(clientPromise))
+      };
+    })->addRef();
   }
 }
 
@@ -479,18 +540,13 @@ public:
   LocalClient(kj::Own<Capability::Server>&& serverParam)
       : server(kj::mv(serverParam)) {
     server->thisHook = this;
-
-    resolveTask = server->shortenPath().map([this](kj::Promise<Capability::Client> promise) {
-      return promise.then([this](Capability::Client&& cap) {
-        auto hook = ClientHook::from(kj::mv(cap));
-        resolved = hook->addRef();
-      }).fork();
-    });
+    startResolveTask();
   }
   LocalClient(kj::Own<Capability::Server>&& serverParam,
               _::CapabilityServerSetBase& capServerSet, void* ptr)
       : server(kj::mv(serverParam)), capServerSet(&capServerSet), ptr(ptr) {
     server->thisHook = this;
+    startResolveTask();
   }
 
   ~LocalClient() noexcept(false) {
@@ -499,6 +555,14 @@ public:
 
   Request<AnyPointer, AnyPointer> newCall(
       uint64_t interfaceId, uint16_t methodId, kj::Maybe<MessageSize> sizeHint) override {
+    KJ_IF_MAYBE(r, resolved) {
+      // We resolved to a shortened path. New calls MUST go directly to the replacement capability
+      // so that their ordering is consistent with callers who call getResolved() to get direct
+      // access to the new capability. In particular it's important that we don't place these calls
+      // in our streaming queue.
+      return r->get()->newCall(interfaceId, methodId, sizeHint);
+    }
+
     auto hook = kj::heap<LocalRequest>(
         interfaceId, methodId, sizeHint, kj::addRef(*this));
     auto root = hook->message->getRoot<AnyPointer>();
@@ -507,6 +571,14 @@ public:
 
   VoidPromiseAndPipeline call(uint64_t interfaceId, uint16_t methodId,
                               kj::Own<CallContextHook>&& context) override {
+    KJ_IF_MAYBE(r, resolved) {
+      // We resolved to a shortened path. New calls MUST go directly to the replacement capability
+      // so that their ordering is consistent with callers who call getResolved() to get direct
+      // access to the new capability. In particular it's important that we don't place these calls
+      // in our streaming queue.
+      return r->get()->call(interfaceId, methodId, kj::mv(context));
+    }
+
     auto contextPtr = context.get();
 
     // We don't want to actually dispatch the call synchronously, because we don't want the callee
@@ -621,6 +693,25 @@ private:
 
   kj::Maybe<kj::ForkedPromise<void>> resolveTask;
   kj::Maybe<kj::Own<ClientHook>> resolved;
+
+  void startResolveTask() {
+    resolveTask = server->shortenPath().map([this](kj::Promise<Capability::Client> promise) {
+      return promise.then([this](Capability::Client&& cap) {
+        auto hook = ClientHook::from(kj::mv(cap));
+
+        if (blocked) {
+          // This is a streaming interface and we have some calls queued up as a result. We cannot
+          // resolve directly to the new shorter path because this may allow new calls to hop
+          // the queue -- we need to embargo new calls until the queue clears out.
+          auto promise = kj::newAdaptedPromise<kj::Promise<void>, BlockedCall>(*this)
+              .then([hook = kj::mv(hook)]() mutable { return kj::mv(hook); });
+          hook = newLocalPromiseClient(kj::mv(promise));
+        }
+
+        resolved = kj::mv(hook);
+      }).fork();
+    });
+  }
 
   class BlockedCall {
   public:
@@ -790,9 +881,9 @@ public:
 
 class BrokenClient final: public ClientHook, public kj::Refcounted {
 public:
-  BrokenClient(const kj::Exception& exception, bool resolved, const void* brand = nullptr)
+  BrokenClient(const kj::Exception& exception, bool resolved, const void* brand)
       : exception(exception), resolved(resolved), brand(brand) {}
-  BrokenClient(const kj::StringPtr description, bool resolved, const void* brand = nullptr)
+  BrokenClient(const kj::StringPtr description, bool resolved, const void* brand)
       : exception(kj::Exception::Type::FAILED, "", 0, kj::str(description)),
         resolved(resolved), brand(brand) {}
 
@@ -837,7 +928,7 @@ private:
 };
 
 kj::Own<ClientHook> BrokenPipeline::getPipelinedCap(kj::ArrayPtr<const PipelineOp> ops) {
-  return kj::refcounted<BrokenClient>(exception, false);
+  return kj::refcounted<BrokenClient>(exception, false, &ClientHook::BROKEN_CAPABILITY_BRAND);
 }
 
 kj::Own<ClientHook> newNullCap() {
@@ -849,11 +940,11 @@ kj::Own<ClientHook> newNullCap() {
 }  // namespace
 
 kj::Own<ClientHook> newBrokenCap(kj::StringPtr reason) {
-  return kj::refcounted<BrokenClient>(reason, false);
+  return kj::refcounted<BrokenClient>(reason, false, &ClientHook::BROKEN_CAPABILITY_BRAND);
 }
 
 kj::Own<ClientHook> newBrokenCap(kj::Exception&& reason) {
-  return kj::refcounted<BrokenClient>(kj::mv(reason), false);
+  return kj::refcounted<BrokenClient>(kj::mv(reason), false, &ClientHook::BROKEN_CAPABILITY_BRAND);
 }
 
 kj::Own<PipelineHook> newBrokenPipeline(kj::Exception&& reason) {

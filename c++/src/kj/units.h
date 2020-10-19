@@ -370,7 +370,7 @@ private:
   template <typename OtherNumber, typename OtherUnit>
   friend class Quantity;
 
-  template <typename Number1, typename Number2, typename Unit2>
+  template <typename Number1, typename Number2, typename Unit2, typename>
   friend inline constexpr auto operator*(Number1 a, Quantity<Number2, Unit2> b)
       -> Quantity<decltype(Number1() * Number2()), Unit2>;
 };
@@ -390,7 +390,8 @@ inline constexpr auto unit() -> decltype(Unit_<T>::get()) { return Unit_<T>::get
 // unit<Quantity<T, U>>() returns a Quantity of value 1.  It also, intentionally, works on basic
 // numeric types.
 
-template <typename Number1, typename Number2, typename Unit>
+template <typename Number1, typename Number2, typename Unit,
+          typename = EnableIf<isIntegralOrBounded<Number1>()>>
 inline constexpr auto operator*(Number1 a, Quantity<Number2, Unit> b)
     -> Quantity<decltype(Number1() * Number2()), Unit> {
   return Quantity<decltype(Number1() * Number2()), Unit>(a * b.value, unsafe);
@@ -1043,14 +1044,14 @@ inline constexpr T unboundAs(U value) {
 
 template <uint64_t requestedMax, uint64_t maxN, typename T>
 inline constexpr T unboundMax(Bounded<maxN, T> value) {
-  // Explicitly ungaurd expecting a value that is at most `maxN`.
+  // Explicitly unguard expecting a value that is at most `maxN`.
   static_assert(maxN <= requestedMax, "possible overflow detected");
   return value.unwrap();
 }
 
 template <uint64_t requestedMax, uint value>
 inline constexpr uint unboundMax(BoundedConst<value>) {
-  // Explicitly ungaurd expecting a value that is at most `maxN`.
+  // Explicitly unguard expecting a value that is at most `maxN`.
   static_assert(value <= requestedMax, "overflow detected");
   return value;
 }
@@ -1058,7 +1059,7 @@ inline constexpr uint unboundMax(BoundedConst<value>) {
 template <uint bits, typename T>
 inline constexpr auto unboundMaxBits(T value) ->
     decltype(unboundMax<maxValueForBits<bits>()>(value)) {
-  // Explicitly ungaurd expecting a value that fits into `bits` bits.
+  // Explicitly unguard expecting a value that fits into `bits` bits.
   return unboundMax<maxValueForBits<bits>()>(value);
 }
 

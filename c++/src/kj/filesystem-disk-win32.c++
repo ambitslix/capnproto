@@ -23,10 +23,7 @@
 // For Unix implementation, see filesystem-disk-unix.c++.
 
 // Request Vista-level APIs.
-#define WINVER 0x0600
-#define _WIN32_WINNT 0x0600
-
-#define WIN32_LEAN_AND_MEAN  // ::eyeroll::
+#include "win32-api-version.h"
 
 #include "filesystem.h"
 #include "debug.h"
@@ -298,7 +295,7 @@ protected:
   }
 };
 
-#if _MSC_VER && _MSC_VER < 1910
+#if _MSC_VER && _MSC_VER < 1910 && !defined(__clang__)
 // TODO(msvc): MSVC 2015 can't initialize a constexpr's vtable correctly.
 const MmapDisposer mmapDisposer = MmapDisposer();
 #else
@@ -1028,7 +1025,7 @@ public:
                 }
             }
 
-            // Succeded, delete temporary.
+            // Succeeded, delete temporary.
             rmrf(*tempName);
             return true;
           } else {
@@ -1295,7 +1292,7 @@ public:
         default:
           KJ_FAIL_WIN32("CopyFile", error, fromPath, toPath) { return false; }
       } else {
-        // Copy succeded.
+        // Copy succeeded.
         return true;
       }
     }

@@ -19,14 +19,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+// Includes just for need SOL_SOCKET and SO_SNDBUF
+#if _WIN32
+#include <kj/win32-api-version.h>
+#endif
+
 #include "rpc-twoparty.h"
 #include "serialize-async.h"
 #include <kj/debug.h>
 #include <kj/io.h>
 
-// Includes just for need SOL_SOCKET and SO_SNDBUF
 #if _WIN32
-#define WIN32_LEAN_AND_MEAN  // ::eyeroll::
 #include <winsock2.h>
 #include <mswsock.h>
 #include <kj/windows-sanity.h>
@@ -219,7 +222,7 @@ size_t TwoPartyVatNetwork::getWindow() {
           s->getsockopt(SOL_SOCKET, SO_SNDBUF, &bufSize, &len);
         }
       }
-      KJ_ASSERT(len == sizeof(bufSize));
+      KJ_ASSERT(len == sizeof(bufSize)) { break; }
     })) {
       if (exception->getType() != kj::Exception::Type::UNIMPLEMENTED) {
         // TODO(someday): Figure out why getting SO_SNDBUF sometimes throws EINVAL. I suspect it
@@ -337,6 +340,26 @@ void TwoPartyServer::accept(
   // Run the connection until disconnect.
   auto promise = connectionState->network.onDisconnect();
   tasks.add(promise.attach(kj::mv(connectionState)));
+}
+
+kj::Promise<void> TwoPartyServer::accept(kj::AsyncIoStream& connection) {
+  auto connectionState = kj::heap<AcceptedConnection>(bootstrapInterface,
+      kj::Own<kj::AsyncIoStream>(&connection, kj::NullDisposer::instance));
+
+  // Run the connection until disconnect.
+  auto promise = connectionState->network.onDisconnect();
+  return promise.attach(kj::mv(connectionState));
+}
+
+kj::Promise<void> TwoPartyServer::accept(
+    kj::AsyncCapabilityStream& connection, uint maxFdsPerMessage) {
+  auto connectionState = kj::heap<AcceptedConnection>(bootstrapInterface,
+      kj::Own<kj::AsyncCapabilityStream>(&connection, kj::NullDisposer::instance),
+      maxFdsPerMessage);
+
+  // Run the connection until disconnect.
+  auto promise = connectionState->network.onDisconnect();
+  return promise.attach(kj::mv(connectionState));
 }
 
 kj::Promise<void> TwoPartyServer::listen(kj::ConnectionReceiver& listener) {

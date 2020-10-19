@@ -31,7 +31,7 @@
 #include <kj/map.h>
 #include <capnp/stream.capnp.h>
 
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 #include <atomic>
 #endif
 
@@ -1295,7 +1295,7 @@ _::RawSchema* SchemaLoader::Impl::load(const schema::Node::Reader& reader, bool 
     // If this schema is not newly-allocated, it may already be in the wild, specifically in the
     // dependency list of other schemas.  Once the initializer is null, it is live, so we must do
     // a release-store here.
-#if __GNUC__
+#if __GNUC__ || defined(__clang__)
     __atomic_store_n(&schema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
     __atomic_store_n(&schema->defaultBrand.lazyInitializer, nullptr, __ATOMIC_RELEASE);
 #elif _MSC_VER
@@ -1392,7 +1392,7 @@ _::RawSchema* SchemaLoader::Impl::loadNative(const _::RawSchema* nativeSchema) {
     // If this schema is not newly-allocated, it may already be in the wild, specifically in the
     // dependency list of other schemas.  Once the initializer is null, it is live, so we must do
     // a release-store here.
-#if __GNUC__
+#if __GNUC__ || defined(__clang__)
     __atomic_store_n(&schema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
     __atomic_store_n(&schema->defaultBrand.lazyInitializer, nullptr, __ATOMIC_RELEASE);
 #elif _MSC_VER
@@ -1508,14 +1508,8 @@ const _::RawBrandedSchema* SchemaLoader::Impl::makeBranded(
 
 const _::RawBrandedSchema* SchemaLoader::Impl::makeBranded(
     const _::RawSchema* schema, kj::ArrayPtr<const _::RawBrandedSchema::Scope> bindings) {
-  // Note that even if `bindings` is empty, we never want to return defaultBrand here because
-  // defaultBrand has special status. Normally, the lack of bindings means all parameters are
-  // "unspecified", which means their bindings are unknown and should be treated as AnyPointer.
-  // But defaultBrand represents a special case where all parameters are still parameters -- they
-  // haven't been bound in the first place. defaultBrand is used to represent the unbranded generic
-  // type, while a no-binding brand is equivalent to binding all parameters to AnyPointer.
-
   if (bindings.size() == 0) {
+    // `defaultBrand` is the version where all type parameters are bound to `AnyPointer`.
     return &schema->defaultBrand;
   }
 
@@ -1918,7 +1912,7 @@ void SchemaLoader::InitializerImpl::init(const _::RawSchema* schema) const {
               "A schema not belonging to this loader used its initializer.");
 
     // Disable the initializer.
-#if __GNUC__
+#if __GNUC__ || defined(__clang__)
     __atomic_store_n(&mutableSchema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
     __atomic_store_n(&mutableSchema->defaultBrand.lazyInitializer, nullptr, __ATOMIC_RELEASE);
 #elif _MSC_VER
@@ -1955,7 +1949,7 @@ void SchemaLoader::BrandedInitializerImpl::init(const _::RawBrandedSchema* schem
   mutableSchema->dependencyCount = deps.size();
 
   // It's initialized now, so disable the initializer.
-#if __GNUC__
+#if __GNUC__ || defined(__clang__)
   __atomic_store_n(&mutableSchema->lazyInitializer, nullptr, __ATOMIC_RELEASE);
 #elif _MSC_VER
   std::atomic_thread_fence(std::memory_order_release);
@@ -1995,7 +1989,10 @@ kj::Maybe<Schema> SchemaLoader::tryGet(
   if (getResult.schema != nullptr && getResult.schema->lazyInitializer == nullptr) {
     if (brand.getScopes().size() > 0) {
       auto brandedSchema = impl.lockExclusive()->get()->makeBranded(
-          getResult.schema, brand, kj::arrayPtr(scope.raw->scopes, scope.raw->scopeCount));
+          getResult.schema, brand,
+          scope.raw->isUnbound()
+              ? kj::Maybe<kj::ArrayPtr<const _::RawBrandedSchema::Scope>>(nullptr)
+              : kj::arrayPtr(scope.raw->scopes, scope.raw->scopeCount));
       brandedSchema->ensureInitialized();
       return Schema(brandedSchema);
     } else {

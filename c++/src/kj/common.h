@@ -25,7 +25,7 @@
 
 #pragma once
 
-#ifdef __GNUC__
+#if defined(__GNUC__) || defined(__clang__)
 #define KJ_BEGIN_SYSTEM_HEADER _Pragma("GCC system_header")
 #elif defined(_MSC_VER)
 #define KJ_BEGIN_SYSTEM_HEADER __pragma(warning(push, 0))
@@ -63,20 +63,20 @@ KJ_BEGIN_HEADER
 
 #ifdef __GNUC__
   #if __clang__
-    #if __clang_major__ < 3 || (__clang_major__ == 3 && __clang_minor__ < 4)
-      #warning "This library requires at least Clang 3.4."
+    #if __clang_major__ < 5
+      #warning "This library requires at least Clang 5.0."
     #elif __cplusplus >= 201402L && !__has_include(<initializer_list>)
       #warning "Your compiler supports C++14 but your C++ standard library does not.  If your "\
                "system has libc++ installed (as should be the case on e.g. Mac OSX), try adding "\
                "-stdlib=libc++ to your CXXFLAGS."
     #endif
   #else
-    #if __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 9)
-      #warning "This library requires at least GCC 4.9."
+    #if __GNUC__ < 5
+      #warning "This library requires at least GCC 5.0."
     #endif
   #endif
 #elif defined(_MSC_VER)
-  #if _MSC_VER < 1910
+  #if _MSC_VER < 1910 && !defined(__clang__)
     #error "You need Visual Studio 2017 or better to compile this code."
   #endif
 #else
@@ -117,7 +117,19 @@ typedef unsigned char byte;
 // Detect whether RTTI and exceptions are enabled, assuming they are unless we have specific
 // evidence to the contrary.  Clients can always define KJ_NO_RTTI or KJ_NO_EXCEPTIONS explicitly
 // to override these checks.
-#ifdef __GNUC__
+
+// TODO: Ideally we'd use __cpp_exceptions/__cpp_rtti not being defined as the first pass since
+//   that is the standard compliant way. However, it's unclear how to use those macros (or any
+//   others) to distinguish between the compiler supporting feature detection and the feature being
+//   disabled vs the compiler not supporting feature detection at all.
+#if defined(__has_feature)
+  #if !defined(KJ_NO_RTTI) && !__has_feature(cxx_rtti)
+    #define KJ_NO_RTTI 1
+  #endif
+  #if !defined(KJ_NO_EXCEPTIONS) && !__has_feature(cxx_exceptions)
+    #define KJ_NO_EXCEPTIONS 1
+  #endif
+#elif defined(__GNUC__)
   #if !defined(KJ_NO_RTTI) && !__GXX_RTTI
     #define KJ_NO_RTTI 1
   #endif
@@ -167,7 +179,7 @@ typedef unsigned char byte;
 #define KJ_ALWAYS_INLINE(...) inline __VA_ARGS__
 // Don't force inline in debug mode.
 #else
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
 #define KJ_ALWAYS_INLINE(...) __forceinline __VA_ARGS__
 #else
 #define KJ_ALWAYS_INLINE(...) inline __VA_ARGS__ __attribute__((always_inline))
@@ -175,7 +187,7 @@ typedef unsigned char byte;
 // Force a function to always be inlined.  Apply only to the prototype, not to the definition.
 #endif
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
 #define KJ_NOINLINE __declspec(noinline)
 #else
 #define KJ_NOINLINE __attribute__((noinline))
@@ -233,7 +245,7 @@ KJ_NORETURN(void unreachable());
 }  // namespace _ (private)
 
 #ifdef KJ_DEBUG
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 #define KJ_IREQUIRE(condition, ...) \
     if (KJ_LIKELY(condition)); else ::kj::_::inlineRequireFailure( \
         __FILE__, __LINE__, #condition, "" #__VA_ARGS__, __VA_ARGS__)
@@ -264,6 +276,20 @@ KJ_NORETURN(void unreachable());
 #define KJ_CLANG_KNOWS_THIS_IS_UNREACHABLE_BUT_GCC_DOESNT
 #else
 #define KJ_CLANG_KNOWS_THIS_IS_UNREACHABLE_BUT_GCC_DOESNT KJ_UNREACHABLE
+#endif
+
+#if __clang__
+#define KJ_KNOWN_UNREACHABLE(code) \
+    do { \
+      _Pragma("clang diagnostic push") \
+      _Pragma("clang diagnostic ignored \"-Wunreachable-code\"") \
+      code; \
+      _Pragma("clang diagnostic pop") \
+    } while (false)
+// Suppress "unreachable code" warnings on intentionally unreachable code.
+#else
+// TODO(someday): Add support for non-clang compilers.
+#define KJ_KNOWN_UNREACHABLE(code) do {code;} while(false)
 #endif
 
 // #define KJ_STACK_ARRAY(type, name, size, minStack, maxStack)
@@ -298,7 +324,7 @@ KJ_NORETURN(void unreachable());
 // Create a unique identifier name.  We use concatenate __LINE__ rather than __COUNTER__ so that
 // the name can be used multiple times in the same macro.
 
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 
 #define KJ_CONSTEXPR(...) __VA_ARGS__
 // Use in cases where MSVC barfs on constexpr. A replacement keyword (e.g. "const") can be
@@ -322,14 +348,6 @@ KJ_NORETURN(void unreachable());
 
 #else  // _MSC_VER
 #define KJ_CONSTEXPR(...) constexpr
-#endif
-
-#if defined(_MSC_VER) && _MSC_VER < 1910
-// TODO(msvc): Visual Studio 2015 mishandles declaring the no-arg constructor `= default` for
-//   certain template types -- it fails to call member constructors.
-#define KJ_DEFAULT_CONSTRUCTOR_VS2015_BUGGY {}
-#else
-#define KJ_DEFAULT_CONSTRUCTOR_VS2015_BUGGY = default;
 #endif
 
 // =======================================================================================
@@ -412,7 +430,7 @@ struct DisallowConstCopy {
 #endif
 };
 
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 
 #define KJ_CPCAP(obj) obj=::kj::cp(obj)
 // TODO(msvc): MSVC refuses to invoke non-const versions of copy constructors in by-value lambda
@@ -700,7 +718,7 @@ inline constexpr float inf() { return (float)(1e300 * 1e300); }
 #pragma warning(pop)
 
 float nan();
-// Unfortunatley, inf() * 0.0f produces a NaN with the sign bit set, whereas our preferred
+// Unfortunately, inf() * 0.0f produces a NaN with the sign bit set, whereas our preferred
 // canonical NaN should not have the sign bit set. std::numeric_limits<float>::quiet_NaN()
 // returns the correct NaN, but we don't want to #include that here. So, we give up and make
 // this out-of-line on MSVC.
@@ -715,7 +733,7 @@ inline constexpr bool isNaN(float f) { return f != f; }
 inline constexpr bool isNaN(double f) { return f != f; }
 
 inline int popCount(unsigned int x) {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && !defined(__clang__)
   return __popcnt(x);
   // Note: __popcnt returns unsigned int, but the value is clearly guaranteed to fit into an int
 #else
@@ -939,7 +957,7 @@ public:
     }
   }
   inline ~NullableValue()
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
       // TODO(msvc): MSVC has a hard time with noexcept specifier expressions that are more complex
       //   than `true` or `false`. We had a workaround for VS2015, but VS2017 regressed.
       noexcept(false)
@@ -1102,7 +1120,7 @@ public:
 private:
   bool isSet;
 
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 #pragma warning(push)
 #pragma warning(disable: 4624)
 // Warns that the anonymous union has a deleted destructor when T is non-trivial. This warning
@@ -1113,7 +1131,7 @@ private:
     T value;
   };
 
-#if _MSC_VER
+#if _MSC_VER && !defined(__clang__)
 #pragma warning(pop)
 #endif
 
@@ -1387,8 +1405,34 @@ public:
   inline constexpr ArrayPtr(decltype(nullptr)): ptr(nullptr), size_(0) {}
   inline constexpr ArrayPtr(T* ptr, size_t size): ptr(ptr), size_(size) {}
   inline constexpr ArrayPtr(T* begin, T* end): ptr(begin), size_(end - begin) {}
+
+#if __GNUC__ && !__clang__ && __GNUC__ >= 9
+// GCC 9 added a warning when we take an initializer_list as a constructor parameter and save a
+// pointer to its content in a class member. GCC apparently imagines we're going to do something
+// dumb like this:
+//     ArrayPtr<const int> ptr = { 1, 2, 3 };
+//     foo(ptr[1]); // undefined behavior!
+// Any KJ programmer should be able to recognize that this is UB, because an ArrayPtr does not own
+// its content. That's not what this constructor is for, tohugh. This constructor is meant to allow
+// code like this:
+//     int foo(ArrayPtr<const int> p);
+//     // ... later ...
+//     foo({1, 2, 3});
+// In this case, the initializer_list's backing array, like any temporary, lives until the end of
+// the statement `foo({1, 2, 3});`. Therefore, it lives at least until the call to foo() has
+// returned, which is exactly what we care about. This usage is fine! GCC is wrong to warn.
+//
+// Amusingly, Clang's implementation has a similar type that they call ArrayRef which apparently
+// triggers this same GCC warning. My guess is that Clang will not introduce a similar warning
+// given that it triggers on their own, legitimate code.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winit-list-lifetime"
+#endif
   inline KJ_CONSTEXPR() ArrayPtr(::std::initializer_list<RemoveConstOrDisable<T>> init)
       : ptr(init.begin()), size_(init.size()) {}
+#if __GNUC__ && !__clang__ && __GNUC__ >= 9
+#pragma GCC diagnostic pop
+#endif
 
   template <size_t size>
   inline constexpr ArrayPtr(T (&native)[size]): ptr(native), size_(size) {

@@ -19,6 +19,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+#if _WIN32
+#include "win32-api-version.h"
+#endif
+
 #include "async.h"
 #include "debug.h"
 #include "thread.h"
@@ -26,7 +30,6 @@
 #include <kj/test.h>
 
 #if _WIN32
-#define WIN32_LEAN_AND_MEAN 1  // lolz
 #include <windows.h>
 #include "windows-sanity.h"
 inline void delay() { Sleep(10); }
@@ -80,7 +83,7 @@ KJ_TEST("synchonous simple cross-thread events") {
 
     KJ_ASSERT(!isChild);
 
-    KJ_EXPECT_THROW_MESSAGE("test exception", exec->executeSync([&]() {
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("test exception", exec->executeSync([&]() {
       KJ_ASSERT(isChild);
       KJ_FAIL_ASSERT("test exception") { break; }
     }));
@@ -132,7 +135,7 @@ KJ_TEST("asynchonous simple cross-thread events") {
 
     KJ_ASSERT(!isChild);
 
-    KJ_EXPECT_THROW_MESSAGE("test exception", exec->executeAsync([&]() {
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("test exception", exec->executeAsync([&]() {
       KJ_ASSERT(isChild);
       KJ_FAIL_ASSERT("test exception") { break; }
     }).wait(waitScope));
@@ -191,7 +194,7 @@ KJ_TEST("synchonous promise cross-thread events") {
 
     KJ_ASSERT(!isChild);
 
-    KJ_EXPECT_THROW_MESSAGE("test exception", exec->executeSync([&]() {
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("test exception", exec->executeSync([&]() {
       KJ_ASSERT(isChild);
       return kj::Promise<void>(KJ_EXCEPTION(FAILED, "test exception"));
     }));
@@ -252,7 +255,7 @@ KJ_TEST("asynchonous promise cross-thread events") {
 
     KJ_ASSERT(!isChild);
 
-    KJ_EXPECT_THROW_MESSAGE("test exception", exec->executeAsync([&]() {
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("test exception", exec->executeAsync([&]() {
       KJ_ASSERT(isChild);
       return kj::Promise<void>(KJ_EXCEPTION(FAILED, "test exception"));
     }).wait(waitScope));
@@ -563,6 +566,266 @@ KJ_TEST("call own thread's executor") {
     }).wait(waitScope);
     KJ_EXPECT(i == 123);
   }
+}
+
+KJ_TEST("synchronous cross-thread event disconnected") {
+  MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
+  Own<PromiseFulfiller<void>> fulfiller;  // accessed only from the subthread
+  thread_local bool isChild = false;  // to assert which thread we're in
+
+  Thread thread([&]() noexcept {
+    isChild = true;
+
+    {
+      KJ_XTHREAD_TEST_SETUP_LOOP;
+
+      auto paf = newPromiseAndFulfiller<void>();
+      fulfiller = kj::mv(paf.fulfiller);
+
+      *executor.lockExclusive() = getCurrentThreadExecutor();
+
+      paf.promise.wait(waitScope);
+
+      // Exit the event loop!
+    }
+
+    // Wait until parent thread sets executor to null, as a way to tell us to quit.
+    executor.lockExclusive().wait([](auto& val) { return val == nullptr; });
+  });
+
+  ([&]() noexcept {
+    Own<const Executor> exec;
+    {
+      auto lock = executor.lockExclusive();
+      lock.wait([&](kj::Maybe<const Executor&> value) { return value != nullptr; });
+      exec = KJ_ASSERT_NONNULL(*lock).addRef();
+    }
+
+    KJ_EXPECT(!isChild);
+
+    KJ_EXPECT(exec->isLive());
+
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+        "Executor's event loop exited before cross-thread event could complete",
+        exec->executeSync([&]() -> Promise<void> {
+          fulfiller->fulfill();
+          return kj::NEVER_DONE;
+        }));
+
+    KJ_EXPECT(!exec->isLive());
+
+    KJ_EXPECT_THROW_MESSAGE(
+        "Executor's event loop has exited",
+        exec->executeSync([&]() {}));
+
+    *executor.lockExclusive() = nullptr;
+  })();
+}
+
+KJ_TEST("asynchronous cross-thread event disconnected") {
+  MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
+  Own<PromiseFulfiller<void>> fulfiller;  // accessed only from the subthread
+  thread_local bool isChild = false;  // to assert which thread we're in
+
+  Thread thread([&]() noexcept {
+    isChild = true;
+
+    {
+      KJ_XTHREAD_TEST_SETUP_LOOP;
+
+      auto paf = newPromiseAndFulfiller<void>();
+      fulfiller = kj::mv(paf.fulfiller);
+
+      *executor.lockExclusive() = getCurrentThreadExecutor();
+
+      paf.promise.wait(waitScope);
+
+      // Exit the event loop!
+    }
+
+    // Wait until parent thread sets executor to null, as a way to tell us to quit.
+    executor.lockExclusive().wait([](auto& val) { return val == nullptr; });
+  });
+
+  ([&]() noexcept {
+    KJ_XTHREAD_TEST_SETUP_LOOP;
+
+    Own<const Executor> exec;
+    {
+      auto lock = executor.lockExclusive();
+      lock.wait([&](kj::Maybe<const Executor&> value) { return value != nullptr; });
+      exec = KJ_ASSERT_NONNULL(*lock).addRef();
+    }
+
+    KJ_EXPECT(!isChild);
+
+    KJ_EXPECT(exec->isLive());
+
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+        "Executor's event loop exited before cross-thread event could complete",
+        exec->executeAsync([&]() -> Promise<void> {
+          fulfiller->fulfill();
+          return kj::NEVER_DONE;
+        }).wait(waitScope));
+
+    KJ_EXPECT(!exec->isLive());
+
+    KJ_EXPECT_THROW_MESSAGE(
+        "Executor's event loop has exited",
+        exec->executeAsync([&]() {}).wait(waitScope));
+
+    *executor.lockExclusive() = nullptr;
+  })();
+}
+
+KJ_TEST("cross-thread event disconnected before it runs") {
+  MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
+  thread_local bool isChild = false;  // to assert which thread we're in
+
+  Thread thread([&]() noexcept {
+    isChild = true;
+
+    KJ_XTHREAD_TEST_SETUP_LOOP;
+
+    *executor.lockExclusive() = getCurrentThreadExecutor();
+
+    // Don't actually run the event loop. Destroy it when the other thread signals us to.
+    executor.lockExclusive().wait([](auto& val) { return val == nullptr; });
+  });
+
+  ([&]() noexcept {
+    KJ_XTHREAD_TEST_SETUP_LOOP;
+
+    Own<const Executor> exec;
+    {
+      auto lock = executor.lockExclusive();
+      lock.wait([&](kj::Maybe<const Executor&> value) { return value != nullptr; });
+      exec = KJ_ASSERT_NONNULL(*lock).addRef();
+    }
+
+    KJ_EXPECT(!isChild);
+
+    KJ_EXPECT(exec->isLive());
+
+    auto promise = exec->executeAsync([&]() {
+      KJ_LOG(ERROR, "shouldn't have executed");
+    });
+    KJ_EXPECT(!promise.poll(waitScope));
+
+    *executor.lockExclusive() = nullptr;
+
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+        "Executor's event loop exited before cross-thread event could complete",
+        promise.wait(waitScope));
+
+    KJ_EXPECT(!exec->isLive());
+  })();
+}
+
+KJ_TEST("cross-thread event disconnected without holding Executor ref") {
+  MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
+  Own<PromiseFulfiller<void>> fulfiller;  // accessed only from the subthread
+  thread_local bool isChild = false;  // to assert which thread we're in
+
+  Thread thread([&]() noexcept {
+    isChild = true;
+
+    {
+      KJ_XTHREAD_TEST_SETUP_LOOP;
+
+      auto paf = newPromiseAndFulfiller<void>();
+      fulfiller = kj::mv(paf.fulfiller);
+
+      *executor.lockExclusive() = getCurrentThreadExecutor();
+
+      paf.promise.wait(waitScope);
+
+      // Exit the event loop!
+    }
+
+    // Wait until parent thread sets executor to null, as a way to tell us to quit.
+    executor.lockExclusive().wait([](auto& val) { return val == nullptr; });
+  });
+
+  ([&]() noexcept {
+    const Executor* exec;
+    {
+      auto lock = executor.lockExclusive();
+      lock.wait([&](kj::Maybe<const Executor&> value) { return value != nullptr; });
+      exec = &KJ_ASSERT_NONNULL(*lock);
+    }
+
+    KJ_EXPECT(!isChild);
+
+    KJ_EXPECT(exec->isLive());
+
+    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
+        "Executor's event loop exited before cross-thread event could complete",
+        exec->executeSync([&]() -> Promise<void> {
+          fulfiller->fulfill();
+          return kj::NEVER_DONE;
+        }));
+
+    // Can't check `exec->isLive()` because it's been destroyed by now.
+
+    *executor.lockExclusive() = nullptr;
+  })();
+}
+
+KJ_TEST("detached cross-thread event doesn't cause crash") {
+  MutexGuarded<kj::Maybe<const Executor&>> executor;  // to get the Executor from the other thread
+  Own<PromiseFulfiller<void>> fulfiller;  // accessed only from the subthread
+
+  Thread thread([&]() noexcept {
+    KJ_XTHREAD_TEST_SETUP_LOOP;
+
+    auto paf = newPromiseAndFulfiller<void>();
+    fulfiller = kj::mv(paf.fulfiller);
+
+    *executor.lockExclusive() = getCurrentThreadExecutor();
+
+    paf.promise.wait(waitScope);
+
+    // Without this poll(), we don't attempt to reply to the other thread? But this isn't required
+    // in other tests, for some reason? Oh well.
+    waitScope.poll();
+
+    executor.lockExclusive().wait([](auto& val) { return val == nullptr; });
+  });
+
+  ([&]() noexcept {
+    {
+      KJ_XTHREAD_TEST_SETUP_LOOP;
+
+      const Executor* exec;
+      {
+        auto lock = executor.lockExclusive();
+        lock.wait([&](kj::Maybe<const Executor&> value) { return value != nullptr; });
+        exec = &KJ_ASSERT_NONNULL(*lock);
+      }
+
+      exec->executeAsync([&]() -> kj::Promise<void> {
+        // Make sure other thread gets time to exit its EventLoop.
+        delay();
+        delay();
+        delay();
+        fulfiller->fulfill();
+        return kj::READY_NOW;
+      }).detach([&](kj::Exception&& e) {
+        KJ_LOG(ERROR, e);
+      });
+
+      // Give the other thread a chance to wake up and start working on the event.
+      delay();
+
+      // Now we'll destroy our EventLoop. That *should* cause detached promises to be destroyed,
+      // thereby cancelling it, before disabling our own executor. However, at one point in the
+      // past, our executor was shut down first, followed by destroying detached promises, which
+      // led to an abort because the other thread had no way to reply back to this thread.
+    }
+
+    *executor.lockExclusive() = nullptr;
+  })();
 }
 
 }  // namespace
